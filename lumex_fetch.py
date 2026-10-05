@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import ssl
 import sys
@@ -25,8 +26,18 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-# ── recovered from libnexuscrypto.so ──────────────────────────────────────────
-GOOGLE_API_KEY = "AIzaSyA7GpkRna8_l-mfGF5PMQZvcxSF5rFAvaw"
+# ── Google API key ───────────────────────────────────────────────────────────
+# Локально можно задать:
+#   export GOOGLE_API_KEY="AIza..."
+#
+# В GitHub Actions ключ передаётся через Secrets.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+
+if not GOOGLE_API_KEY:
+    raise RuntimeError(
+        "GOOGLE_API_KEY is not set. "
+        "Set the environment variable GOOGLE_API_KEY."
+    )
 
 # backend.txt on Drive (file id 1x8UAg4bH9Pzv7lj55PAoePI6QT7QeFcW)
 BACKEND_URLS = [
