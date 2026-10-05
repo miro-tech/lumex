@@ -8,10 +8,11 @@ Flow:
   3. Download Google Drive file
   4. base64-decode → extract trojan:// vless:// … URIs
   5. Normalize server names:
-       - URL-decode URI fragment
+       - extract serverDescription from fragment
        - decode serverDescription from Base64
        - remove invisible Unicode characters
        - use readable serverDescription as server name
+       - remove serverDescription from URI
   6. Save to files
 
 Usage:
@@ -29,18 +30,19 @@ import os
 import re
 import ssl
 import sys
-import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 
 # ── Google API key ───────────────────────────────────────────────────────────
+
 # Локально:
 #   export GOOGLE_API_KEY="AIza..."
 #
 # GitHub Actions:
 #   secrets.GOOGLE_API_KEY
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
 if not GOOGLE_API_KEY:
@@ -77,7 +79,7 @@ CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
 
 
-# ── HTTP ──────────────────────────────────────────────────────────────────────
+# ── HTTP ─────────────────────────────────────────────────────────────────────
 
 def http_get(url: str, timeout: int = 15) -> bytes:
     req = urllib.request.Request(
@@ -114,7 +116,9 @@ def fetch_remote_config() -> dict:
 
         except Exception as e:
             last_err = e
-            print(f"[remote-config] fail {url}: {e}")
+            print(
+                f"[remote-config] fail {url}: {e}"
+            )
 
     raise RuntimeError(
         f"remote-config unreachable: {last_err}"
@@ -186,7 +190,10 @@ def decode_subscription(raw: bytes) -> str:
 
     # Base64 wrapper
     try:
-        pad = "=" * ((4 - len(text) % 4) % 4)
+
+        pad = "=" * (
+            (4 - len(text) % 4) % 4
+        )
 
         decoded = base64.b64decode(
             text + pad,
@@ -208,8 +215,17 @@ def remove_invisible_unicode(text: str) -> str:
     Удаляет невидимые/служебные Unicode-символы,
     которые LUMEX добавляет в названия серверов.
 
-    Сохраняет обычные буквы, цифры, emoji,
-    пробелы и знаки пунктуации.
+    Удаляются:
+
+      U+200B ... U+200F
+      U+202A ... U+202E
+      U+2060 ... U+206F
+      U+FEFF
+
+    Также удаляются ASCII control characters.
+
+    Обычные буквы, цифры, emoji,
+    пробелы и пунктуация сохраняются.
     """
 
     result = []
@@ -228,7 +244,11 @@ def remove_invisible_unicode(text: str) -> str:
             continue
 
         # ASCII control characters
-        if code < 32 and ch not in ("\t", "\n", "\r"):
+        if code < 32 and ch not in (
+            "\t",
+            "\n",
+            "\r",
+        ):
             continue
 
         result.append(ch)
@@ -240,24 +260,32 @@ def remove_invisible_unicode(text: str) -> str:
 
 def decode_server_description(value: str) -> str:
     """
-    Decode:
+    Декодирует LUMEX serverDescription.
 
-        ?serverDescription=8J+foiDQmtCw0L3QsNC7IOKAoiBU
+    Например:
 
-    LUMEX использует URL query + Base64.
+        8J+foiDQmtCw0L3QsNC7IOKAoiBU
+
     """
 
     if not value:
         return ""
 
-    # Иногда '+' приходит как пробел после parse_qs().
-    value = value.replace(" ", "+")
+    # Если Base64 находится в URL,
+    # '+' иногда превращается в пробел.
+    value = value.replace(
+        " ",
+        "+",
+    )
 
     # URL decode
-    value = urllib.parse.unquote(value).strip()
+    value = urllib.parse.unquote(
+        value
+    ).strip()
 
     try:
-        # Добавляем padding.
+
+        # Добавляем Base64 padding.
         padding = "=" * (
             (4 - len(value) % 4) % 4
         )
@@ -272,7 +300,9 @@ def decode_server_description(value: str) -> str:
             errors="replace",
         )
 
-        text = remove_invisible_unicode(text)
+        text = remove_invisible_unicode(
+            text
+        )
 
         return text.strip()
 
@@ -288,45 +318,93 @@ def decode_server_description(value: str) -> str:
 
 def normalize_uri(uri: str) -> str:
     """
-    Преобразует LUMEX URI в более читаемый вид для NekoBox.
+    Нормализует LUMEX URI.
 
-    Что делаем:
+    ВАЖНО:
 
-      1. Извлекаем ?serverDescription=...
-      2. Декодируем Base64 description.
-      3. Удаляем мусорные invisible Unicode.
-      4. Если description есть — используем его как имя.
-      5. Убираем сам serverDescription из URI.
-      6. URL-decode старый fragment.
-      7. Удаляем invisible Unicode из старого fragment.
-      8. Сохраняем реальные параметры подключения.
+    LUMEX сейчас отдаёт serverDescription
+    НЕ в обычном query, а внутри fragment:
+
+        #🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
+
+    Поэтому обычный parse_qsl(parts.query)
+    его не видит.
+
+    Мы отдельно разбираем fragment.
+
+    Пример исходного:
+
+        trojan://USER@IP:443?...#🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
+
+    После обработки:
+
+        trojan://USER@IP:443?...#🚀 Мой сервер: T
+
+    При этом реальные параметры подключения
+    полностью сохраняются.
     """
 
-    # --------------------------------------------------
-    # 1. Разделяем URI на base/query/fragment
-    # --------------------------------------------------
+    # ==========================================================
+    # 1. Разбираем URI
+    # ==========================================================
 
     try:
-        parts = urllib.parse.urlsplit(uri)
+
+        parts = urllib.parse.urlsplit(
+            uri
+        )
 
     except Exception:
         return uri
 
-    base = parts.scheme + "://" + parts.netloc
+    base = (
+        parts.scheme
+        + "://"
+        + parts.netloc
+    )
 
     query = parts.query
     fragment = parts.fragment
 
-    # --------------------------------------------------
-    # 2. Читаем query
-    # --------------------------------------------------
+    # ==========================================================
+    # 2. Извлекаем serverDescription
+    #    из fragment
+    # ==========================================================
+
+    server_description = ""
+
+    marker = "?serverDescription="
+
+    if marker in fragment:
+
+        old_fragment, desc_value = (
+            fragment.split(
+                marker,
+                1,
+            )
+        )
+
+        # Оставляем только настоящую
+        # часть имени до ?serverDescription
+        fragment = old_fragment
+
+        server_description = (
+            decode_server_description(
+                desc_value
+            )
+        )
+
+    # ==========================================================
+    # 3. Дополнительно проверяем обычный query
+    #
+    # На случай, если LUMEX в будущем
+    # перенесёт serverDescription туда.
+    # ==========================================================
 
     query_items = urllib.parse.parse_qsl(
         query,
         keep_blank_values=True,
     )
-
-    server_description = ""
 
     clean_query = []
 
@@ -334,47 +412,75 @@ def normalize_uri(uri: str) -> str:
 
         if key.lower() == "serverdescription":
 
-            server_description = (
-                decode_server_description(value)
+            decoded = (
+                decode_server_description(
+                    value
+                )
             )
+
+            if decoded:
+                server_description = decoded
 
             continue
 
         clean_query.append(
-            (key, value)
+            (
+                key,
+                value,
+            )
         )
 
-    # --------------------------------------------------
-    # 3. Обрабатываем старый fragment
-    # --------------------------------------------------
+    # ==========================================================
+    # 4. Обрабатываем старый fragment
+    # ==========================================================
 
     readable_fragment = ""
 
     if fragment:
 
-        readable_fragment = urllib.parse.unquote(
-            fragment
+        readable_fragment = (
+            urllib.parse.unquote(
+                fragment
+            )
         )
 
-        readable_fragment = remove_invisible_unicode(
-            readable_fragment
+        readable_fragment = (
+            remove_invisible_unicode(
+                readable_fragment
+            )
+        )
+
+        readable_fragment = re.sub(
+            r"\s+",
+            " ",
+            readable_fragment,
         ).strip()
 
-    # --------------------------------------------------
-    # 4. Выбираем имя
-    # --------------------------------------------------
+    # ==========================================================
+    # 5. Выбираем имя
+    # ==========================================================
 
     if server_description:
 
-        readable_name = server_description
+        readable_name = (
+            server_description
+        )
 
     else:
 
-        readable_name = readable_fragment
+        readable_name = (
+            readable_fragment
+        )
 
-    # --------------------------------------------------
-    # 5. Удаляем лишние пробелы
-    # --------------------------------------------------
+    # ==========================================================
+    # 6. Финальная очистка имени
+    # ==========================================================
+
+    readable_name = (
+        remove_invisible_unicode(
+            readable_name
+        )
+    )
 
     readable_name = re.sub(
         r"\s+",
@@ -382,28 +488,42 @@ def normalize_uri(uri: str) -> str:
         readable_name,
     ).strip()
 
-    # --------------------------------------------------
-    # 6. Собираем query обратно
-    # --------------------------------------------------
+    # ==========================================================
+    # 7. Собираем query обратно
+    #
+    # ВАЖНО:
+    # реальные параметры подключения
+    # остаются без изменений по смыслу.
+    # ==========================================================
 
-    clean_query_string = urllib.parse.urlencode(
-        clean_query,
-        doseq=True,
+    clean_query_string = (
+        urllib.parse.urlencode(
+            clean_query,
+            doseq=True,
+        )
     )
 
-    # --------------------------------------------------
-    # 7. Собираем URI
-    # --------------------------------------------------
+    # ==========================================================
+    # 8. Собираем итоговый URI
+    # ==========================================================
 
     result = base
 
     if clean_query_string:
-        result += "?" + clean_query_string
+
+        result += (
+            "?"
+            + clean_query_string
+        )
 
     if readable_name:
-        result += "#" + urllib.parse.quote(
-            readable_name,
-            safe="",
+
+        result += (
+            "#"
+            + urllib.parse.quote(
+                readable_name,
+                safe="",
+            )
         )
 
     return result
@@ -411,18 +531,26 @@ def normalize_uri(uri: str) -> str:
 
 # ── Extract URIs ─────────────────────────────────────────────────────────────
 
-def extract_uris(sub_text: str) -> list[str]:
+def extract_uris(
+    sub_text: str,
+) -> list[str]:
 
-    raw_uris = URI_RE.findall(sub_text)
+    raw_uris = URI_RE.findall(
+        sub_text
+    )
 
     result = []
 
     for uri in raw_uris:
 
-        normalized = normalize_uri(uri)
+        normalized = normalize_uri(
+            uri
+        )
 
         if normalized:
-            result.append(normalized)
+            result.append(
+                normalized
+            )
 
     return result
 
@@ -437,7 +565,10 @@ def uri_host(uri: str) -> str:
     )
 
     if m:
-        return f"{m.group(1)}:{m.group(2)}"
+        return (
+            f"{m.group(1)}:"
+            f"{m.group(2)}"
+        )
 
     m = re.search(
         r"://([^:/]+):(\d+)",
@@ -445,7 +576,10 @@ def uri_host(uri: str) -> str:
     )
 
     if m:
-        return f"{m.group(1)}:{m.group(2)}"
+        return (
+            f"{m.group(1)}:"
+            f"{m.group(2)}"
+        )
 
     return "?"
 
@@ -455,7 +589,9 @@ def uri_host(uri: str) -> str:
 def main() -> int:
 
     ap = argparse.ArgumentParser(
-        description="LUMEX VPN config fetcher"
+        description=(
+            "LUMEX VPN config fetcher"
+        )
     )
 
     ap.add_argument(
@@ -467,7 +603,10 @@ def main() -> int:
     ap.add_argument(
         "--drive-id",
         default=None,
-        help="override driveSubFileId (skip remote-config)",
+        help=(
+            "override driveSubFileId "
+            "(skip remote-config)"
+        ),
     )
 
     ap.add_argument(
@@ -478,7 +617,9 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    out = Path(args.out)
+    out = Path(
+        args.out
+    )
 
     out.mkdir(
         parents=True,
@@ -492,7 +633,7 @@ def main() -> int:
             args.backend.rstrip("/"),
         )
 
-    # ── 1. remote-config ──────────────────────────────────────────────────────
+    # ── 1. remote-config ─────────────────────────────────────────────────────
 
     drive_id = args.drive_id
     remote = {}
@@ -503,7 +644,10 @@ def main() -> int:
 
             remote = fetch_remote_config()
 
-            (out / "remote_config.json").write_text(
+            (
+                out
+                / "remote_config.json"
+            ).write_text(
                 json.dumps(
                     remote,
                     indent=2,
@@ -513,60 +657,74 @@ def main() -> int:
             )
 
             print(
-                "[save] remote_config.json"
+                "[save] "
+                "remote_config.json"
             )
 
             drive_id = (
-                remote.get("driveSubFileId")
+                remote.get(
+                    "driveSubFileId"
+                )
                 or FALLBACK_DRIVE_ID
             )
 
             print(
                 "[remote-config] "
-                f"driveSubFileId = {drive_id}"
+                f"driveSubFileId = "
+                f"{drive_id}"
             )
 
             print(
                 "[remote-config] "
-                f"driveEnabled   = {remote.get('driveEnabled')}"
+                f"driveEnabled   = "
+                f"{remote.get('driveEnabled')}"
             )
 
             print(
                 "[remote-config] "
-                f"marzbanEnabled = {remote.get('marzbanEnabled')}"
+                f"marzbanEnabled = "
+                f"{remote.get('marzbanEnabled')}"
             )
 
             print(
                 "[remote-config] "
-                f"configVersion  = {remote.get('configVersion')}"
+                f"configVersion  = "
+                f"{remote.get('configVersion')}"
             )
 
         except Exception as e:
 
             print(
                 "[remote-config] "
-                f"using fallback drive id: {e}"
+                f"using fallback drive id: "
+                f"{e}"
             )
 
-            drive_id = FALLBACK_DRIVE_ID
+            drive_id = (
+                FALLBACK_DRIVE_ID
+            )
 
-    # ── 2. Google Drive ───────────────────────────────────────────────────────
+    # ── 2. Google Drive ──────────────────────────────────────────────────────
 
     raw = download_drive(
         drive_id
     )
 
-    (out / "drive_raw.bin").write_bytes(
+    (
+        out / "drive_raw.bin"
+    ).write_bytes(
         raw
     )
 
-    # ── 3. decode subscription ────────────────────────────────────────────────
+    # ── 3. Decode subscription ───────────────────────────────────────────────
 
     sub_text = decode_subscription(
         raw
     )
 
-    (out / "subscription.txt").write_text(
+    (
+        out / "subscription.txt"
+    ).write_text(
         sub_text,
         encoding="utf-8",
     )
@@ -576,7 +734,7 @@ def main() -> int:
         f"({len(sub_text)} chars)"
     )
 
-    # ── 4. extract + normalize URIs ───────────────────────────────────────────
+    # ── 4. Extract + normalize URIs ──────────────────────────────────────────
 
     uris = extract_uris(
         sub_text
@@ -588,7 +746,11 @@ def main() -> int:
 
     all_path.write_text(
         "\n".join(uris)
-        + ("\n" if uris else ""),
+        + (
+            "\n"
+            if uris
+            else ""
+        ),
         encoding="utf-8",
     )
 
@@ -597,9 +759,12 @@ def main() -> int:
         f"({len(uris)} URIs)"
     )
 
-    # ── group by protocol ────────────────────────────────────────────────────
+    # ── Group by protocol ────────────────────────────────────────────────────
 
-    by_proto: dict[str, list[str]] = {}
+    by_proto: dict[
+        str,
+        list[str],
+    ] = {}
 
     for u in uris:
 
@@ -616,7 +781,7 @@ def main() -> int:
             [],
         ).append(u)
 
-    # ── server JSON ──────────────────────────────────────────────────────────
+    # ── Server JSON ──────────────────────────────────────────────────────────
 
     servers = []
 
@@ -630,7 +795,9 @@ def main() -> int:
             .lower()
         )
 
-        host = uri_host(u)
+        host = uri_host(
+            u
+        )
 
         servers.append(
             {
@@ -640,7 +807,9 @@ def main() -> int:
             }
         )
 
-    (out / "lumex_uris.json").write_text(
+    (
+        out / "lumex_uris.json"
+    ).write_text(
         json.dumps(
             {
                 "driveSubFileId": drive_id,
@@ -661,7 +830,7 @@ def main() -> int:
         "[save] lumex_uris.json"
     )
 
-    # ── summary ───────────────────────────────────────────────────────────────
+    # ── Summary ───────────────────────────────────────────────────────────────
 
     print()
     print(
@@ -673,7 +842,8 @@ def main() -> int:
     ):
 
         print(
-            f"  {proto}: {len(items)}"
+            f"  {proto}: "
+            f"{len(items)}"
         )
 
     print()
