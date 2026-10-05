@@ -8,16 +8,28 @@ Flow:
   3. Download Google Drive file
   4. base64-decode → extract trojan:// vless:// … URIs
   5. Normalize server names:
+       - preserve the original server name completely
        - extract serverDescription from fragment
        - decode serverDescription from Base64
        - remove invisible Unicode characters
-       - use readable serverDescription as server name
-       - remove serverDescription from URI
+       - append serverDescription to the original name
+       - remove technical serverDescription parameter
   6. Save to files
 
-Usage:
-  python3 lumex_fetch.py
-  python3 lumex_fetch.py --out /path/to/dir
+IMPORTANT:
+  Connection parameters are NOT modified.
+
+Example:
+
+  Original:
+
+    trojan://USER@IP:443?...#🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
+
+  Result:
+
+    trojan://USER@IP:443?...#🇳🇱Login:LUMEXVPN2 • decoded description
+
+The part before '#' is preserved exactly.
 """
 
 from __future__ import annotations
@@ -53,6 +65,8 @@ BACKEND_URLS = [
     "http://193.23.201.236",
 ]
 
+
+# Fallback driveSubFileId if remote-config is unreachable
 FALLBACK_DRIVE_ID = "1p3zomBe8rmJwtX2sJD2c7Jm5hetfTWFm"
 
 
@@ -102,7 +116,9 @@ def fetch_remote_config() -> dict:
             raw = http_get(url)
             data = json.loads(raw)
 
-            print(f"[remote-config] OK  {url}")
+            print(
+                f"[remote-config] OK  {url}"
+            )
 
             return data
 
@@ -110,11 +126,13 @@ def fetch_remote_config() -> dict:
             last_err = e
 
             print(
-                f"[remote-config] fail {url}: {e}"
+                f"[remote-config] fail "
+                f"{url}: {e}"
             )
 
     raise RuntimeError(
-        f"remote-config unreachable: {last_err}"
+        f"remote-config unreachable: "
+        f"{last_err}"
     )
 
 
@@ -157,11 +175,13 @@ def download_drive(
             last_err = e
 
             print(
-                f"[drive] fail {url[:70]}…: {e}"
+                f"[drive] fail "
+                f"{url[:70]}…: {e}"
             )
 
     raise RuntimeError(
-        f"Drive download failed: {last_err}"
+        f"Drive download failed: "
+        f"{last_err}"
     )
 
 
@@ -169,7 +189,7 @@ def download_drive(
 
 def decode_subscription(raw: bytes) -> str:
     """
-    Drive file is base64(plain subscription text).
+    Drive file is normally base64(plain subscription text).
     """
 
     text = raw.decode(
@@ -183,6 +203,7 @@ def decode_subscription(raw: bytes) -> str:
 
     # Base64 wrapper
     try:
+
         pad = "=" * (
             (4 - len(text) % 4) % 4
         )
@@ -204,25 +225,25 @@ def decode_subscription(raw: bytes) -> str:
 
 def remove_invisible_unicode(text: str) -> str:
     """
-    Удаляет невидимые/служебные Unicode-символы,
-    которые LUMEX добавляет в названия серверов.
+    Removes invisible/formatting Unicode characters.
 
-    Удаляются:
+    Removed:
 
       U+200B ... U+200F
       U+202A ... U+202E
       U+2060 ... U+206F
       U+FEFF
 
-    Также удаляются ASCII control characters.
+    Also removes ASCII control characters.
 
-    Обычные буквы, цифры, emoji,
-    пробелы и пунктуация сохраняются.
+    Normal letters, numbers, emoji,
+    spaces and punctuation are preserved.
     """
 
     result = []
 
     for ch in text:
+
         code = ord(ch)
 
         # Zero-width / formatting characters
@@ -249,36 +270,38 @@ def remove_invisible_unicode(text: str) -> str:
 
 # ── Base64 description decoder ───────────────────────────────────────────────
 
-def decode_server_description(value: str) -> str:
+def decode_server_description(
+    value: str,
+) -> str:
     """
-    Декодирует LUMEX serverDescription.
+    Decode LUMEX serverDescription.
 
-    Пример:
+    Example:
 
         8J+foiDQmtCw0L3QsNC7IOKAoiBU
 
-    Может находиться:
-      - URL-encoded
-      - с '+' вместо пробелов
-      - без Base64 padding
+    Supports:
+      - URL encoding
+      - '+' / spaces
+      - missing Base64 padding
     """
 
     if not value:
         return ""
 
-    # URL decode сначала.
+    # URL decode.
     value = urllib.parse.unquote(
         value
     ).strip()
 
-    # Если Base64 проходил через form/query,
-    # '+' мог превратиться в пробел.
+    # '+' may have become spaces.
     value = value.replace(
         " ",
         "+",
     )
 
     try:
+
         padding = "=" * (
             (4 - len(value) % 4) % 4
         )
@@ -313,64 +336,114 @@ def decode_server_description(value: str) -> str:
         return ""
 
 
+# ── Server name cleanup ──────────────────────────────────────────────────────
+
+def clean_server_name(
+    name: str,
+) -> str:
+    """
+    Cleans a server name without removing
+    meaningful text.
+
+    IMPORTANT:
+
+      Login:LUMEXVPN2
+      Швеция
+      Россия
+      🇳🇱
+      🇸🇪
+      🇷🇺
+
+    are preserved.
+    """
+
+    if not name:
+        return ""
+
+    name = urllib.parse.unquote(
+        name
+    )
+
+    name = remove_invisible_unicode(
+        name
+    )
+
+    name = re.sub(
+        r"\s+",
+        " ",
+        name,
+    )
+
+    return name.strip()
+
+
 # ── URI normalizer ───────────────────────────────────────────────────────────
 
 def normalize_uri(uri: str) -> str:
     """
-    Нормализует LUMEX URI.
+    Normalize LUMEX URI.
 
-    LUMEX может отдавать:
+    IMPORTANT:
 
-        trojan://USER@IP:443?...#OLD_NAME?serverDescription=BASE64
+    The original server name is preserved.
 
-    Например:
+    Example input:
 
-        #%F0%9F%87%B3%F0%9F%87%B1Login%3ALUMEXVPN2%E2%81%AF%E2%80%8B%E2%81%A5?serverDescription=BASE64
+      #🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
 
-    ВАЖНО:
+    Result:
 
-    serverDescription находится ПОСЛЕ '#',
-    поэтому urlsplit().query его не видит.
+      #🇳🇱Login:LUMEXVPN2 • decoded description
 
-    Мы:
-      1. сохраняем scheme + netloc;
-      2. сохраняем query подключения;
-      3. ищем serverDescription внутри fragment;
-      4. декодируем его;
-      5. удаляем serverDescription;
-      6. используем полученное значение как имя;
-      7. реальные параметры подключения не изменяем.
+    We do NOT delete:
+
+      Login:LUMEXVPN2
+      Швеция
+      Россия
+      country flag
+      any other original name text
+
+    Only serverDescription itself is removed from
+    the fragment after being decoded.
+
+    The connection parameters before '#' are preserved.
     """
 
     try:
-        parts = urllib.parse.urlsplit(uri)
+        parts = urllib.parse.urlsplit(
+            uri
+        )
 
     except Exception:
         return uri
 
     # ==========================================================
-    # 1. Базовая часть URI
+    # IMPORTANT:
+    #
+    # Preserve everything before '#'.
+    #
+    # Do NOT rebuild the query using urlencode().
+    # This avoids changing existing URL encoding.
     # ==========================================================
 
-    base = (
-        parts.scheme
-        + "://"
-        + parts.netloc
-    )
+    if parts.fragment:
+        base = uri.split(
+            "#",
+            1,
+        )[0]
 
-    query = parts.query
+    else:
+        base = uri
+
     fragment = parts.fragment
 
     # ==========================================================
-    # 2. Ищем serverDescription внутри fragment
+    # 1. Find serverDescription inside fragment
     #
-    # Например:
+    # Example:
     #
-    # #OLD_NAME?serverDescription=BASE64
+    # #🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
     #
-    # или:
-    #
-    # #OLD_NAME?serverDescription=BASE64&...
     # ==========================================================
 
     server_description = ""
@@ -391,161 +464,104 @@ def normalize_uri(uri: str) -> str:
             )
         )
 
-        # Удаляем весь ?serverDescription=...
-        # из fragment.
+        # Remove ONLY:
+        #
+        # ?serverDescription=BASE64
+        #
+        # from the name.
+        #
+        # Everything before it is preserved.
         fragment = (
             fragment[:match.start()]
             + fragment[match.end():]
         )
 
-        # Если после description остались
-        # лишние query-параметры fragment,
-        # удаляем их тоже.
-        fragment = re.sub(
-            r"[?&]serverDescription=[^&#]*",
-            "",
-            fragment,
-            flags=re.IGNORECASE,
-        )
-
         print(
-            "[name] "
+            "[name-description] "
             f"{server_description!r}"
         )
 
     # ==========================================================
-    # 3. Проверяем обычный query
+    # 2. Clean original server name
     #
-    # На случай изменения формата LUMEX
-    # в будущем.
+    # Nothing meaningful is removed.
     # ==========================================================
 
-    query_items = urllib.parse.parse_qsl(
-        query,
-        keep_blank_values=True,
+    old_name = clean_server_name(
+        fragment
     )
 
-    clean_query = []
-
-    for key, value in query_items:
-
-        if key.lower() == "serverdescription":
-
-            decoded = (
-                decode_server_description(
-                    value
-                )
-            )
-
-            if decoded:
-                server_description = decoded
-
-            continue
-
-        clean_query.append(
-            (
-                key,
-                value,
-            )
-        )
-
     # ==========================================================
-    # 4. Обрабатываем старое имя
+    # 3. Clean decoded description
     # ==========================================================
 
-    readable_fragment = ""
-
-    if fragment:
-
-        readable_fragment = (
-            urllib.parse.unquote(
-                fragment
-            )
-        )
-
-        readable_fragment = (
-            remove_invisible_unicode(
-                readable_fragment
-            )
-        )
-
-        readable_fragment = re.sub(
-            r"\s+",
-            " ",
-            readable_fragment,
-        ).strip()
+    server_description = clean_server_name(
+        server_description
+    )
 
     # ==========================================================
-    # 5. serverDescription имеет приоритет
+    # 4. Combine names
+    #
+    # Original name ALWAYS has priority.
+    #
+    # Example:
+    #
+    # old:
+    #   🇳🇱Login:LUMEXVPN2
+    #
+    # description:
+    #   🟢 Канал • T
+    #
+    # result:
+    #   🇳🇱Login:LUMEXVPN2 • 🟢 Канал • T
     # ==========================================================
 
-    if server_description:
+    if old_name and server_description:
 
         readable_name = (
-            server_description
+            old_name
+            + " • "
+            + server_description
         )
+
+    elif old_name:
+
+        readable_name = old_name
+
+    elif server_description:
+
+        readable_name = server_description
 
     else:
 
-        readable_name = (
-            readable_fragment
-        )
+        readable_name = ""
 
     # ==========================================================
-    # 6. Финальная очистка имени
+    # 5. Final cleanup
     # ==========================================================
 
-    readable_name = (
-        remove_invisible_unicode(
-            readable_name
-        )
+    readable_name = clean_server_name(
+        readable_name
     )
 
-    readable_name = re.sub(
-        r"\s+",
-        " ",
-        readable_name,
-    ).strip()
-
     # ==========================================================
-    # 7. Query собираем обратно
+    # 6. Build final URI
     #
-    # Здесь сохраняются ВСЕ обычные параметры
-    # подключения, кроме serverDescription,
-    # если он вдруг был в query.
+    # Everything before '#' comes from the original URI.
     # ==========================================================
-
-    clean_query_string = (
-        urllib.parse.urlencode(
-            clean_query,
-            doseq=True,
-        )
-    )
-
-    # ==========================================================
-    # 8. Собираем URI
-    # ==========================================================
-
-    result = base
-
-    if clean_query_string:
-
-        result += (
-            "?"
-            + clean_query_string
-        )
 
     if readable_name:
 
-        result += (
-            "#"
+        return (
+            base
+            + "#"
             + urllib.parse.quote(
                 readable_name,
                 safe="",
             )
         )
 
-    return result
+    return base
 
 
 # ── Extract URIs ─────────────────────────────────────────────────────────────
@@ -576,7 +592,9 @@ def extract_uris(
 
 # ── Host extractor ───────────────────────────────────────────────────────────
 
-def uri_host(uri: str) -> str:
+def uri_host(
+    uri: str,
+) -> str:
 
     m = re.search(
         r"@([^:/]+):(\d+)",
