@@ -1,0 +1,119 @@
+name: LUMEX VPN Fetch
+
+on:
+  schedule:
+    # каждые 30 минут
+    - cron: "1 1 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run LUMEX fetcher
+        run: |
+          mkdir -p output
+
+          python3 lumex_fetch.py \
+            --out output
+
+      - name: Show result
+        run: |
+          echo "=== LUMEX RESULT ==="
+
+          if [ -f output/lumex_uris_all.txt ]; then
+            echo "URI count:"
+            grep -c '://' output/lumex_uris_all.txt || true
+
+            echo
+            echo "Protocols:"
+            sed 's/:\/\/.*//' output/lumex_uris_all.txt \
+              | sort \
+              | uniq -c \
+              | sort -rn
+
+            echo
+            echo "File size:"
+            wc -c output/lumex_uris_all.txt
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumex-output
+          path: output/
+          retention-days: 3
+
+      - name: Update Gist
+        env:
+          GH_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          gist_id = os.environ["GIST_ID"]
+
+          files = {}
+
+          files["lumex_uris_all.txt"] = {
+              "content": open(
+                  "output/lumex_uris_all.txt",
+                  "r",
+                  encoding="utf-8"
+              ).read()
+          }
+
+          if os.path.exists("output/lumex_uris.json"):
+              files["lumex_uris.json"] = {
+                  "content": open(
+                      "output/lumex_uris.json",
+                      "r",
+                      encoding="utf-8"
+                  ).read()
+              }
+
+          if os.path.exists("output/remote_config.json"):
+              files["remote_config.json"] = {
+                  "content": open(
+                      "output/remote_config.json",
+                      "r",
+                      encoding="utf-8"
+                  ).read()
+              }
+
+          payload = json.dumps({
+              "files": files
+          }).encode()
+
+          req = urllib.request.Request(
+              f"https://api.github.com/gists/{gist_id}",
+              data=payload,
+              method="PATCH",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "User-Agent": "lumex-github-action",
+              },
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as response:
+              print("Gist updated:", response.status)
+          PY
