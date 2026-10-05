@@ -3,7 +3,7 @@ name: LUMEX VPN Fetch
 on:
   schedule:
     # каждые 30 минут
-    - cron: "*/30 * * * *"
+    - cron: "1 1 * * *"
 
   workflow_dispatch:
 
