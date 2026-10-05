@@ -35,13 +35,7 @@ import urllib.request
 from pathlib import Path
 
 
-# ── Google API key ───────────────────────────────────────────────────────────
-
-# Локально:
-#   export GOOGLE_API_KEY="AIza..."
-#
-# GitHub Actions:
-#   secrets.GOOGLE_API_KEY
+# ── Google API key ────────────────────────────────────────────────────────────
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 
@@ -59,8 +53,6 @@ BACKEND_URLS = [
     "http://193.23.201.236",
 ]
 
-
-# fallback driveSubFileId if remote-config is unreachable
 FALLBACK_DRIVE_ID = "1p3zomBe8rmJwtX2sJD2c7Jm5hetfTWFm"
 
 
@@ -116,6 +108,7 @@ def fetch_remote_config() -> dict:
 
         except Exception as e:
             last_err = e
+
             print(
                 f"[remote-config] fail {url}: {e}"
             )
@@ -190,7 +183,6 @@ def decode_subscription(raw: bytes) -> str:
 
     # Base64 wrapper
     try:
-
         pad = "=" * (
             (4 - len(text) % 4) % 4
         )
@@ -231,7 +223,6 @@ def remove_invisible_unicode(text: str) -> str:
     result = []
 
     for ch in text:
-
         code = ord(ch)
 
         # Zero-width / formatting characters
@@ -262,30 +253,32 @@ def decode_server_description(value: str) -> str:
     """
     Декодирует LUMEX serverDescription.
 
-    Например:
+    Пример:
 
         8J+foiDQmtCw0L3QsNC7IOKAoiBU
 
+    Может находиться:
+      - URL-encoded
+      - с '+' вместо пробелов
+      - без Base64 padding
     """
 
     if not value:
         return ""
 
-    # Если Base64 находится в URL,
-    # '+' иногда превращается в пробел.
+    # URL decode сначала.
+    value = urllib.parse.unquote(
+        value
+    ).strip()
+
+    # Если Base64 проходил через form/query,
+    # '+' мог превратиться в пробел.
     value = value.replace(
         " ",
         "+",
     )
 
-    # URL decode
-    value = urllib.parse.unquote(
-        value
-    ).strip()
-
     try:
-
-        # Добавляем Base64 padding.
         padding = "=" * (
             (4 - len(value) % 4) % 4
         )
@@ -304,7 +297,13 @@ def decode_server_description(value: str) -> str:
             text
         )
 
-        return text.strip()
+        text = re.sub(
+            r"\s+",
+            " ",
+            text,
+        ).strip()
+
+        return text
 
     except (
         ValueError,
@@ -320,42 +319,38 @@ def normalize_uri(uri: str) -> str:
     """
     Нормализует LUMEX URI.
 
+    LUMEX может отдавать:
+
+        trojan://USER@IP:443?...#OLD_NAME?serverDescription=BASE64
+
+    Например:
+
+        #%F0%9F%87%B3%F0%9F%87%B1Login%3ALUMEXVPN2%E2%81%AF%E2%80%8B%E2%81%A5?serverDescription=BASE64
+
     ВАЖНО:
 
-    LUMEX сейчас отдаёт serverDescription
-    НЕ в обычном query, а внутри fragment:
+    serverDescription находится ПОСЛЕ '#',
+    поэтому urlsplit().query его не видит.
 
-        #🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
-
-    Поэтому обычный parse_qsl(parts.query)
-    его не видит.
-
-    Мы отдельно разбираем fragment.
-
-    Пример исходного:
-
-        trojan://USER@IP:443?...#🇳🇱Login:LUMEXVPN2?serverDescription=BASE64
-
-    После обработки:
-
-        trojan://USER@IP:443?...#🚀 Мой сервер: T
-
-    При этом реальные параметры подключения
-    полностью сохраняются.
+    Мы:
+      1. сохраняем scheme + netloc;
+      2. сохраняем query подключения;
+      3. ищем serverDescription внутри fragment;
+      4. декодируем его;
+      5. удаляем serverDescription;
+      6. используем полученное значение как имя;
+      7. реальные параметры подключения не изменяем.
     """
 
-    # ==========================================================
-    # 1. Разбираем URI
-    # ==========================================================
-
     try:
-
-        parts = urllib.parse.urlsplit(
-            uri
-        )
+        parts = urllib.parse.urlsplit(uri)
 
     except Exception:
         return uri
+
+    # ==========================================================
+    # 1. Базовая часть URI
+    # ==========================================================
 
     base = (
         parts.scheme
@@ -367,26 +362,28 @@ def normalize_uri(uri: str) -> str:
     fragment = parts.fragment
 
     # ==========================================================
-    # 2. Извлекаем serverDescription
-    #    из fragment
+    # 2. Ищем serverDescription внутри fragment
+    #
+    # Например:
+    #
+    # #OLD_NAME?serverDescription=BASE64
+    #
+    # или:
+    #
+    # #OLD_NAME?serverDescription=BASE64&...
     # ==========================================================
 
     server_description = ""
 
-    marker = "?serverDescription="
+    match = re.search(
+        r"\?serverDescription=([^&#]*)",
+        fragment,
+        flags=re.IGNORECASE,
+    )
 
-    if marker in fragment:
+    if match:
 
-        old_fragment, desc_value = (
-            fragment.split(
-                marker,
-                1,
-            )
-        )
-
-        # Оставляем только настоящую
-        # часть имени до ?serverDescription
-        fragment = old_fragment
+        desc_value = match.group(1)
 
         server_description = (
             decode_server_description(
@@ -394,11 +391,33 @@ def normalize_uri(uri: str) -> str:
             )
         )
 
+        # Удаляем весь ?serverDescription=...
+        # из fragment.
+        fragment = (
+            fragment[:match.start()]
+            + fragment[match.end():]
+        )
+
+        # Если после description остались
+        # лишние query-параметры fragment,
+        # удаляем их тоже.
+        fragment = re.sub(
+            r"[?&]serverDescription=[^&#]*",
+            "",
+            fragment,
+            flags=re.IGNORECASE,
+        )
+
+        print(
+            "[name] "
+            f"{server_description!r}"
+        )
+
     # ==========================================================
-    # 3. Дополнительно проверяем обычный query
+    # 3. Проверяем обычный query
     #
-    # На случай, если LUMEX в будущем
-    # перенесёт serverDescription туда.
+    # На случай изменения формата LUMEX
+    # в будущем.
     # ==========================================================
 
     query_items = urllib.parse.parse_qsl(
@@ -431,7 +450,7 @@ def normalize_uri(uri: str) -> str:
         )
 
     # ==========================================================
-    # 4. Обрабатываем старый fragment
+    # 4. Обрабатываем старое имя
     # ==========================================================
 
     readable_fragment = ""
@@ -457,7 +476,7 @@ def normalize_uri(uri: str) -> str:
         ).strip()
 
     # ==========================================================
-    # 5. Выбираем имя
+    # 5. serverDescription имеет приоритет
     # ==========================================================
 
     if server_description:
@@ -489,11 +508,11 @@ def normalize_uri(uri: str) -> str:
     ).strip()
 
     # ==========================================================
-    # 7. Собираем query обратно
+    # 7. Query собираем обратно
     #
-    # ВАЖНО:
-    # реальные параметры подключения
-    # остаются без изменений по смыслу.
+    # Здесь сохраняются ВСЕ обычные параметры
+    # подключения, кроме serverDescription,
+    # если он вдруг был в query.
     # ==========================================================
 
     clean_query_string = (
@@ -504,7 +523,7 @@ def normalize_uri(uri: str) -> str:
     )
 
     # ==========================================================
-    # 8. Собираем итоговый URI
+    # 8. Собираем URI
     # ==========================================================
 
     result = base
@@ -833,6 +852,7 @@ def main() -> int:
     # ── Summary ───────────────────────────────────────────────────────────────
 
     print()
+
     print(
         f"=== {len(uris)} URIs ==="
     )
