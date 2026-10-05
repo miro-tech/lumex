@@ -3,7 +3,7 @@ name: LUMEX VPN Fetch
 on:
   schedule:
     # каждые 30 минут
-    - cron: "1 1 * * *"
+    - cron: "*/30 * * * *"
 
   workflow_dispatch:
 
@@ -24,6 +24,8 @@ jobs:
           python-version: "3.12"
 
       - name: Run LUMEX fetcher
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         run: |
           mkdir -p output
 
